@@ -81,6 +81,9 @@ class Semaphore(AbstractLinkable): # pylint:disable=undefined-variable
     .. versionchanged:: 24.2.1
        Uses Python 3 native lock timeouts for cross-thread operations instead
        of spinning.
+    .. versionchanged:: NEXT
+       A main hub with no referenced watchers can wait for a semaphore
+       acquired by another native thread.
     """
 
     __slots__ = (
@@ -258,8 +261,11 @@ class Semaphore(AbstractLinkable): # pylint:disable=undefined-variable
                 success = True
             else:
                 # Avoid using ex.hub property to keep holding the GIL
-                if len(args) == 3 and args[1].main_hub:
-                    # The main hub, meaning the main thread. We probably can do nothing with this.
+                if (len(args) == 3 and args[1].main_hub
+                        and self._multithreaded is not _MULTI):
+                    # A single-threaded main hub cannot make progress. A native
+                    # thread may still release a multithreaded semaphore: the
+                    # async watcher below keeps an otherwise idle hub alive.
                     raise
                 return self.__acquire_from_other_thread(
                     (self.hub, get_hub_if_exists(), self._getcurrent(), "LoopExit"),

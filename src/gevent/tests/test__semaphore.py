@@ -87,6 +87,7 @@ class TestSemaphoreMultiThread(greentest.TestCase):
 
     def _makeThreadMain(self, thread_running, thread_acquired, sem,
                         acquired, exc_info,
+                        release_in_thread=None,
                         **thread_acquire_kwargs):
         from gevent._hub_local import get_hub_if_exists
         import sys
@@ -97,6 +98,10 @@ class TestSemaphoreMultiThread(greentest.TestCase):
                 acquired.append(
                     sem.acquire(**thread_acquire_kwargs)
                 )
+                if release_in_thread is not None:
+                    thread_acquired.set()
+                    self.assertTrue(release_in_thread.wait(5))
+                    sem.release()
             except:
                 exc_info[:] = sys.exc_info()
                 raise # Print
@@ -114,12 +119,12 @@ class TestSemaphoreMultiThread(greentest.TestCase):
                                              release=True,
                                              require_thread_acquired_to_finish=False,
                                              **thread_acquire_kwargs):
-        from gevent import monkey
-        self.assertFalse(monkey.is_module_patched('threading'))
+        self.assertFalse(gevent.monkey.is_module_patched('threading'))
 
         import threading
         thread_running = threading.Event()
         thread_acquired = threading.Event()
+        release_in_thread = threading.Event() if release else None
 
         sem = self._makeOne()
         # Make future acquires block
@@ -131,6 +136,7 @@ class TestSemaphoreMultiThread(greentest.TestCase):
         t = threading.Thread(target=self._makeThreadMain(
             thread_running, thread_acquired, sem,
             acquired, exc_info,
+            release_in_thread=release_in_thread,
             **thread_acquire_kwargs
         ))
         t.daemon = True
@@ -152,6 +158,33 @@ class TestSemaphoreMultiThread(greentest.TestCase):
                     break
 
             self.assertEqual(acquired, [True])
+
+            # Reverse the contention: the native thread now holds the lock and
+            # the main hub must wait without any referenced watchers.
+            hub = gevent.get_hub()
+            real_loop = hub.loop
+
+            class LoopProxy(object):
+                def __getattr__(self, name):
+                    return getattr(real_loop, name)
+
+                def async_(self, *args, **kwargs):
+                    # An early release could hide LoopExit. Hold the native
+                    # thread until acquire reaches the async-watcher fallback.
+                    watcher = real_loop.async_(*args, **kwargs)
+                    release_in_thread.set()
+                    return watcher
+
+            hub.loop = LoopProxy()
+            try:
+                self.assertTrue(sem.acquire())
+                sem.release()
+                self.assertTrue(hub.join(timing.LARGE_TICK))
+            finally:
+                hub.loop = real_loop
+                release_in_thread.set()
+                t.join(5)
+            self.assertFalse(t.is_alive())
 
         if not release and thread_acquire_kwargs.get("timeout"):
             # Spin the loop to be sure that the timeout has a chance to
